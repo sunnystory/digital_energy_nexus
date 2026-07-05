@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-Energy & Digital Access Diagnostic — Public Institutions (Liberia)
+Energy & Digital Access Diagnostic — Public Institution (Liberia)
 
 Pipeline:
     1. Download education + health public institutions from OpenStreetMap.
