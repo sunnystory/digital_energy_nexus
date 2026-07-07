@@ -1,13 +1,13 @@
 # -*- coding: utf-8 -*-
 """
-Energy & Digital Access Diagnostic — Public Institutions (Liberia example)
+Energy & Digital Access Diagnostic — Public Institutions (Liberia)
 
 Pipeline:
     1. Download education + health public institutions from OpenStreetMap.
     2. Load existing/planned energy infrastructure layers (grid line,
        transformers, planned NEA expansion transformers, mini-grids).
     3. Load telecom tower data and classify each institution's mobile
-       coverage using per-tower buffer radii.
+       coverage using per-tower buffer radius.
     4. Classify each institution's energy access status.
     5. Combine energy + digital status into a four-way access typology:
        "Energy + Digital access", "Energy only", "Digital only",
@@ -16,11 +16,19 @@ Pipeline:
 
 Run as a script, or cell-by-cell in VSCode / Jupyter using the "# %%" markers.
 
-Requires: geopandas, osmnx, shapely, folium, pyogrio, pandas, numpy
-    pip install geopandas osmnx shapely folium pyogrio pandas numpy openpyxl
+Requires: geopandas, osmnx, shapely, folium, pyogrio, pandas, numpy, truststore
+    pip install geopandas osmnx shapely folium pyogrio pandas numpy openpyxl truststore
 """
 
 # %%
+# On a corporate network, Python's bundled CA list (certifi) usually doesn't
+# include the corporate proxy's TLS-inspection root certificate, so requests
+# to nominatim/overpass fail with SSLCertVerificationError. `truststore` makes
+# Python use the Windows certificate store instead (which already trusts the
+# corporate root), so this must run before osmnx/requests make any HTTP calls.
+import truststore
+truststore.inject_into_ssl()
+
 import os
 import time
 
@@ -95,6 +103,13 @@ ox.settings.use_cache = True
 ox.settings.log_console = True
 ox.settings.timeout = 600
 
+# osmnx's default max query area (2,500 km^2) is much smaller than Liberia
+# (~111,000 km^2), so a country-wide query gets split into ~70 sub-queries,
+# each throttled ~25-30s apart by the public Overpass server (very slow, and
+# prone to 504 timeouts on the server side). Raising this lets Liberia be
+# queried in a single request instead.
+ox.settings.max_query_area_size = 150_000_000_000  # ~150,000 km^2
+
 
 # =========================================================
 # 2. HELPER FUNCTIONS
@@ -154,12 +169,13 @@ def add_nearest_distance_km(points_gdf, target_gdf, distance_col):
 
 
 def get_map_center(*gdfs):
-    """Get a reasonable map center from one or more GeoDataFrames."""
+    """Get a reasonable map center from one or more GeoDataFrames (any geometry type)."""
     frames = [g.to_crs(CRS_WGS84) for g in gdfs if g is not None and len(g) > 0]
     if not frames:
         return [6.4281, -9.4295]  # Liberia, approximate center
     combined = pd.concat(frames, ignore_index=True)
-    return [combined.geometry.y.mean(), combined.geometry.x.mean()]
+    centroids = gpd.GeoSeries(combined.geometry, crs=CRS_WGS84).to_crs(CRS_METRIC).centroid.to_crs(CRS_WGS84)
+    return [centroids.y.mean(), centroids.x.mean()]
 
 
 def save_map(m, filename):
@@ -177,12 +193,11 @@ def save_map(m, filename):
 # =========================================================
 
 EDUCATION_TAGS = {
-    "amenity": ["school", "kindergarten", "college", "university", "library"]
+    "amenity": ["school", "kindergarten", "college", "university"]
 }
 
 HEALTH_TAGS = {
-    # Remove "pharmacy"/"dentist" below if they should not count as health institutions.
-    "amenity": ["hospital", "clinic", "doctors", "health_post", "pharmacy", "dentist"],
+    "amenity": ["hospital", "clinic", "doctors", "health_post"],
     "healthcare": True,
 }
 
