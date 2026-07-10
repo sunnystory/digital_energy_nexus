@@ -16,8 +16,11 @@ Pipeline:
 
 Run as a script, or cell-by-cell in VSCode / Jupyter using the "# %%" markers.
 
-Requires: geopandas, osmnx, shapely, folium, pyogrio, pandas, numpy, truststore
-    pip install geopandas osmnx shapely folium pyogrio pandas numpy openpyxl truststore
+Requires: geopandas, osmnx, shapely, folium, pyogrio, pandas, numpy, truststore, python-dotenv
+    pip install geopandas osmnx shapely folium pyogrio pandas numpy openpyxl truststore python-dotenv
+
+Secrets: put GIGA_API_TOKEN=<your token> in a ".env" file next to this script
+(never commit it or paste it into chat/code; ".env" is already gitignored).
 """
 
 # %%
@@ -36,14 +39,21 @@ import numpy as np
 import pandas as pd
 import geopandas as gpd
 import osmnx as ox
+import requests
 import folium
-from folium.plugins import MarkerCluster
+from dotenv import load_dotenv
 
 try:
     from IPython.display import display
 except ImportError:
     def display(*args, **kwargs):
         pass
+
+# Loads GIGA_API_TOKEN (and any other secrets) from a ".env" file placed next
+# to this script, so tokens never need to appear in the code itself.
+# (Uses a fixed path rather than __file__, since __file__ isn't defined when
+# running cell-by-cell in VSCode's Interactive Window / Jupyter.)
+load_dotenv(r"C:\Users\wb632724\Downloads\e&d\.env")
 
 # =========================================================
 # 1. CONFIGURATION
@@ -74,8 +84,17 @@ TOWER_LON_COL = "Longitude"
 TOWER_LAT_COL = "Latitude"
 TOWER_TECH_COL = "Technology"
 
-# --- Optional Giga school data (set to a path to enable) ---
-GIGA_PATH = None
+# --- Optional Giga school data (GigaMaps API) ---
+# Set the GIGA_API_TOKEN environment variable to your API token to enable this
+# step; leave it unset to skip and use OSM institutions only. Never hardcode
+# the token in this file.
+GIGA_API_BASE_URL = "https://uni-ooi-giga-maps-service.azurewebsites.net"
+GIGA_API_TOKEN = os.environ.get("GIGA_API_TOKEN", "")
+GIGA_COUNTRY_ISO3 = "LBR"  # Liberia
+# Giga schools within this distance of an existing OSM education institution
+# are treated as the same school (Giga's dataset itself incorporates OSM data)
+# and are skipped rather than added as a second, duplicate point.
+GIGA_DEDUP_DISTANCE_KM = 0.15
 
 # --- Energy access thresholds (km) ---
 # "Existing" infrastructure (a, b, d) counts toward current energy access.
@@ -187,6 +206,19 @@ def save_map(m, filename):
     return out_path
 
 
+def add_legend(m, title, items):
+    """Add a fixed-position HTML legend to a Folium map. items: list of (label, color)."""
+    rows = "".join(f'<span style="color:{color};">&#9679;</span> {label}<br>' for label, color in items)
+    html = f"""
+    <div style="position: fixed; bottom: 40px; left: 40px; width: 260px;
+    background-color: white; z-index:9999; font-size:13px; border:2px solid grey; padding: 10px;">
+    <b>{title}</b><br><br>
+    {rows}
+    </div>
+    """
+    m.get_root().html.add_child(folium.Element(html))
+
+
 # %%
 # =========================================================
 # 3. DOWNLOAD PUBLIC INSTITUTIONS (EDUCATION + HEALTH) FROM OSM
@@ -252,40 +284,58 @@ print(public_inst["institution_type"].value_counts())
 
 # %%
 # =========================================================
-# 3b. OPTIONAL: ADD GIGA SCHOOL DATA
+# 3b. OPTIONAL: ADD GIGA SCHOOL DATA (GigaMaps API)
 # =========================================================
 
-def detect_column(columns, candidates):
-    lower_map = {c.lower(): c for c in columns}
-    for cand in candidates:
-        if cand.lower() in lower_map:
-            return lower_map[cand.lower()]
-    return None
+def fetch_giga_schools(country_iso3, api_token, base_url=GIGA_API_BASE_URL, page_size=1000, max_pages=100):
+    """Page through GigaMaps' schools_location/country endpoint and return all results."""
+    headers = {"Authorization": f"Bearer {api_token}"}
+    records = []
+    for page in range(1, max_pages + 1):
+        resp = requests.get(
+            f"{base_url}/api/v1/schools_location/country/{country_iso3}",
+            headers=headers,
+            params={"page": page, "size": page_size},
+            timeout=60,
+        )
+        resp.raise_for_status()
+        batch = resp.json().get("data", [])  # response is {"success", "timestamp", "data": [...]}
+        if not batch:
+            break
+        records.extend(batch)
+        if len(batch) < page_size:
+            break
+    return pd.DataFrame(records)
 
 
-if GIGA_PATH is not None and os.path.exists(GIGA_PATH):
-    giga_df = pd.read_csv(GIGA_PATH) if GIGA_PATH.lower().endswith(".csv") else pd.read_excel(GIGA_PATH)
+if GIGA_API_TOKEN:
+    giga_df = fetch_giga_schools(GIGA_COUNTRY_ISO3, GIGA_API_TOKEN)
+    print(f"Fetched {len(giga_df):,} Giga school records for {GIGA_COUNTRY_ISO3}")
 
-    lon_col = detect_column(giga_df.columns, ["longitude", "lon", "x"])
-    lat_col = detect_column(giga_df.columns, ["latitude", "lat", "y"])
-    name_col = detect_column(giga_df.columns, ["name", "school_name", "school"])
-    if lon_col is None or lat_col is None:
-        raise ValueError("Could not detect longitude/latitude columns in Giga data.")
+    giga_gdf = make_point_gdf_from_lonlat(giga_df, lon_col="longitude", lat_col="latitude")
+    giga_gdf["institution_name"] = giga_gdf["school_name"].fillna("Unnamed Giga school")
+    giga_gdf["institution_type"] = "Education"
+    giga_gdf["institution_source"] = "Giga"
 
-    giga_gdf = make_point_gdf_from_lonlat(giga_df, lon_col=lon_col, lat_col=lat_col)
-    giga_inst = gpd.GeoDataFrame({
-        "institution_name": giga_gdf[name_col] if name_col else "Giga school",
-        "institution_type": "Education",
-        "institution_source": "Giga",
-        "geometry": giga_gdf.geometry,
-    }, crs=CRS_WGS84)
+    # Drop Giga schools that are effectively the same physical school as an
+    # OSM education institution already in public_inst (Giga's own dataset
+    # incorporates OSM, so near-duplicates are expected).
+    existing_education = public_inst[public_inst["institution_type"] == "Education"]
+    giga_gdf = add_nearest_distance_km(giga_gdf, existing_education, "dist_to_nearest_osm_education_km")
+    is_new = giga_gdf["dist_to_nearest_osm_education_km"].isna() | (
+        giga_gdf["dist_to_nearest_osm_education_km"] > GIGA_DEDUP_DISTANCE_KM
+    )
+    giga_new = giga_gdf[is_new][["institution_name", "institution_type", "institution_source", "geometry"]].copy()
 
-    public_inst = pd.concat([public_inst, giga_inst], ignore_index=True)
+    print(f"Giga schools matching an existing OSM institution (skipped): {(~is_new).sum():,}")
+    print(f"Giga schools not in OSM (added): {len(giga_new):,}")
+
+    public_inst = pd.concat([public_inst, giga_new], ignore_index=True)
     public_inst = gpd.GeoDataFrame(public_inst, geometry="geometry", crs=CRS_WGS84)
     public_inst["institution_id"] = public_inst.index + 1
     print("Combined public institutions (OSM + Giga):", public_inst.shape)
 else:
-    print("No Giga file provided. Using OSM institutions only.")
+    print("GIGA_API_TOKEN not set. Using OSM institutions only.")
 
 
 # %%
@@ -465,7 +515,7 @@ print(overall_summary)
 # --- Public institutions ---
 m_inst = folium.Map(location=get_map_center(public_inst), zoom_start=7, tiles="CartoDB positron")
 inst_type_colors = {"Education": "blue", "Health": "red"}
-inst_cluster = MarkerCluster(name="Public institutions").add_to(m_inst)
+inst_group = folium.FeatureGroup(name="Public institutions").add_to(m_inst)
 for _, row in public_inst.iterrows():
     folium.CircleMarker(
         location=[row.geometry.y, row.geometry.x],
@@ -478,7 +528,8 @@ for _, row in public_inst.iterrows():
             f"<b>{row['institution_name']}</b><br>Type: {row['institution_type']}<br>Source: {row['institution_source']}",
             max_width=300,
         ),
-    ).add_to(inst_cluster)
+    ).add_to(inst_group)
+add_legend(m_inst, "Institution Type", list(inst_type_colors.items()))
 folium.LayerControl(collapsed=False).add_to(m_inst)
 save_map(m_inst, "01_public_institutions.html")
 
@@ -496,16 +547,19 @@ energy_point_layers = [
     (nea_expansion_transformers, "NEA grid expansion transformers (planned)", "orange"),
     (minigrid, "Mini-grids", "green"),
 ]
+energy_legend_items = [("Existing distribution line", "black")]
 for layer_gdf, layer_name, color in energy_point_layers:
     if layer_gdf is None:
         continue
-    cluster = MarkerCluster(name=layer_name).add_to(m_energy)
+    group = folium.FeatureGroup(name=layer_name).add_to(m_energy)
     for _, row in layer_gdf.iterrows():
         geom = row.geometry if row.geometry.geom_type == "Point" else row.geometry.representative_point()
         folium.CircleMarker(
             location=[geom.y, geom.x], radius=4, color=color, fill=True,
             fill_color=color, fill_opacity=0.8, popup=layer_name,
-        ).add_to(cluster)
+        ).add_to(group)
+    energy_legend_items.append((layer_name, color))
+add_legend(m_energy, "Energy Infrastructure", energy_legend_items)
 folium.LayerControl(collapsed=False).add_to(m_energy)
 save_map(m_energy, "02_energy_layers.html")
 
@@ -513,7 +567,7 @@ save_map(m_energy, "02_energy_layers.html")
 center = get_map_center(public_inst, towers)
 m_towers = folium.Map(location=center, zoom_start=7, tiles="CartoDB positron")
 tower_colors = {"4G": "green", "3G": "orange", "2G": "blue"}
-tower_cluster = MarkerCluster(name="Telecom towers").add_to(m_towers)
+tower_group = folium.FeatureGroup(name="Telecom towers").add_to(m_towers)
 for _, row in towers.iterrows():
     folium.CircleMarker(
         location=[row.geometry.y, row.geometry.x],
@@ -523,7 +577,8 @@ for _, row in towers.iterrows():
         fill_color=tower_colors.get(row["tower_tech_class"], "gray"),
         fill_opacity=0.75,
         popup=f"Tower {row['tower_id']}<br>Class: {row['tower_tech_class']}<br>Buffer: {row['tower_radius_km']} km",
-    ).add_to(tower_cluster)
+    ).add_to(tower_group)
+add_legend(m_towers, "Tower Coverage Class", list(tower_colors.items()))
 folium.LayerControl(collapsed=False).add_to(m_towers)
 save_map(m_towers, "03_digital_towers.html")
 
@@ -536,7 +591,7 @@ access_colors = {
     "Digital only": "blue",
     "No energy or digital access": "red",
 }
-final_cluster = MarkerCluster(name="Public institutions by combined access status").add_to(m_final)
+final_group = folium.FeatureGroup(name="Public institutions by combined access status").add_to(m_final)
 for _, row in inst_access.iterrows():
     popup = f"""
     <b>{row['institution_name']}</b><br>
@@ -560,19 +615,9 @@ for _, row in inst_access.iterrows():
         fill_color=access_colors.get(row["combined_access_status"], "gray"),
         fill_opacity=0.75,
         popup=folium.Popup(popup, max_width=400),
-    ).add_to(final_cluster)
+    ).add_to(final_group)
 
-legend_html = """
-<div style="position: fixed; bottom: 40px; left: 40px; width: 260px;
-background-color: white; z-index:9999; font-size:13px; border:2px solid grey; padding: 10px;">
-<b>Public Institution Access Status</b><br><br>
-<span style="color:green;">&#9679;</span> Energy + Digital access<br>
-<span style="color:orange;">&#9679;</span> Energy only<br>
-<span style="color:blue;">&#9679;</span> Digital only<br>
-<span style="color:red;">&#9679;</span> No energy or digital access<br>
-</div>
-"""
-m_final.get_root().html.add_child(folium.Element(legend_html))
+add_legend(m_final, "Public Institution Access Status", list(access_colors.items()))
 folium.LayerControl(collapsed=False).add_to(m_final)
 save_map(m_final, "04_public_institution_energy_digital_access.html")
 
