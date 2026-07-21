@@ -2,6 +2,7 @@
 Geospatial analysis guidance for digital and energy co-delpoyment
 
 1. Overview <br>
+
 1.1 Purpose <br>
 This toolkit documents a replicable, map-based method that takes a country from diagnosis to procurement-ready delivery decisions for joint energy–digital investments at public institutions. It answers, in sequence: where the electricity and connectivity gaps are (Step i), what the local conditions around each gap site look like (Step ii), and which delivery model — extending existing infrastructure, building new, a service contract, or satellite — fits each site, in what priority order and procurement bundles (Step iii). Step iii itself runs on a three-tier (Tier 1-3) decision logic — distance rules, demand floors, and a priority score — detailed in Section 2. <br>
 •	Step (i) — diagnose where energy and digital access gaps exist  <br>
