@@ -1,5 +1,6 @@
-# digital_energy_nexus
-Geospatial analysis guidance for digital and energy co-delpoyment
+# Digital_Energy_Nexus
+Geospatial analysis guidance for digital and energy co-delpoyment <br> 
+
 
 1. Overview <br>
 
